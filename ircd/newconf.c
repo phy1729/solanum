@@ -6,6 +6,8 @@
 #ifdef HAVE_LIBCRYPTO
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/err.h>
+
 #endif
 
 #include "newconf.h"
@@ -538,7 +540,9 @@ conf_end_oper(struct TopConf *tc)
 	}
 
 #ifdef HAVE_LIBCRYPTO
-	if(EmptyString(yy_oper->passwd) && EmptyString(yy_oper->rsa_pubkey_file))
+	if(EmptyString(yy_oper->passwd) &&
+	   EmptyString(yy_oper->rsa_pubkey_file) &&
+	   EmptyString(yy_oper->x25519_pubkey_txt))
 #else
 	if(EmptyString(yy_oper->passwd))
 #endif
@@ -595,6 +599,29 @@ conf_end_oper(struct TopConf *tc)
 				conf_report_error("Ignoring operator block for %s -- "
 						"rsa_public_key_file key invalid; check syntax",
 						yy_tmpoper->name);
+				return 0;
+			}
+		}
+
+		if (yy_oper->x25519_pubkey_txt)
+		{
+			int raw_len;
+			unsigned char *raw = rb_base64_decode(yy_oper->x25519_pubkey_txt, strlen(yy_oper->x25519_pubkey_txt), &raw_len);
+			if(raw == NULL)
+			{
+				conf_report_error("Ignoring operator block for %s -- "
+						"x25519_public_key base64 invalid; check syntax",
+						yy_tmpoper->name);
+				return 0;
+			}
+
+			yy_tmpoper->x25519_pubkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, raw, raw_len);
+			rb_free(raw);
+			if(yy_tmpoper->x25519_pubkey == NULL)
+			{
+				conf_report_error("Ignoring operator block for %s -- "
+						"x25519_public_key key invalid; check syntax %d %s",
+						yy_tmpoper->name, raw_len, ERR_error_string(ERR_get_error(), NULL));
 				return 0;
 			}
 		}
@@ -688,6 +715,17 @@ conf_set_oper_rsa_public_key_file(void *data)
 	yy_oper->rsa_pubkey_file = rb_strdup((char *) data);
 #else
 	conf_report_error("Warning -- ignoring rsa_public_key_file (OpenSSL support not available");
+#endif
+}
+
+static void
+conf_set_oper_x25519_public_key(void *data)
+{
+#ifdef HAVE_LIBCRYPTO
+	rb_free(yy_oper->x25519_pubkey_txt);
+	yy_oper->x25519_pubkey_txt = rb_strdup((char *) data);
+#else
+	conf_report_error("Warning -- ignoring x25519_public_key (OpenSSL support not available");
 #endif
 }
 
@@ -2564,6 +2602,7 @@ static struct ConfEntry conf_log_table[] =
 static struct ConfEntry conf_operator_table[] =
 {
 	{ "rsa_public_key_file",  CF_QSTRING, conf_set_oper_rsa_public_key_file, 0, NULL },
+	{ "x25519_public_key", CF_QSTRING, conf_set_oper_x25519_public_key, 0, NULL },
 	{ "flags",	CF_STRING | CF_FLIST, conf_set_oper_flags,	0, NULL },
 	{ "umodes",	CF_STRING | CF_FLIST, conf_set_oper_umodes,	0, NULL },
 	{ "privset",	CF_QSTRING, conf_set_oper_privset,	0, NULL },

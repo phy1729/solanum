@@ -25,6 +25,7 @@
 #include "stdinc.h"
 
 #ifdef HAVE_LIBCRYPTO
+#include <openssl/hmac.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
@@ -85,6 +86,7 @@ mapi_clist_av1 challenge_clist[] = { &challenge_msgtab, NULL };
 DECLARE_MODULE_AV2(challenge, NULL, NULL, challenge_clist, NULL, NULL, NULL, NULL, challenge_desc);
 
 static bool generate_challenge(char **r_challenge, char **r_response, RSA * key);
+static bool generate_challenge_gen(char const* token, int id, EVP_MD const* md, EVP_PKEY *pub, char **r_challenge, char **r_response);
 
 static void
 cleanup_challenge(struct Client *target_p)
@@ -109,7 +111,6 @@ m_challenge(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *sou
 	struct oper_conf *oper_p;
 	char *challenge = NULL; /* to placate gcc */
 	char chal_line[CHALLENGE_WIDTH];
-	unsigned char *b_response;
 	size_t cnt;
 	int len = 0;
 
@@ -156,10 +157,7 @@ m_challenge(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *sou
 		}
 
 		parv[1]++;
-		b_response = rb_base64_decode((const unsigned char *)parv[1], strlen(parv[1]), &len);
-
-		if(len != SHA_DIGEST_LENGTH ||
-		   memcmp(source_p->localClient->challenge, b_response, SHA_DIGEST_LENGTH))
+		if(strcmp(source_p->localClient->challenge, parv[1]))
 		{
 			sendto_one(source_p, form_str(ERR_PASSWDMISMATCH), me.name, source_p->name);
 			ilog(L_FOPER, "FAILED CHALLENGE (%s) by (%s!%s@%s) (%s)",
@@ -172,12 +170,9 @@ m_challenge(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *sou
 						     source_p->name, source_p->username,
 						     source_p->host);
 
-			rb_free(b_response);
 			cleanup_challenge(source_p);
 			return;
 		}
-
-		rb_free(b_response);
 
 		oper_p = find_oper_conf(source_p->username, source_p->orighost,
 					source_p->sockhost,
@@ -229,7 +224,7 @@ m_challenge(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *sou
 		return;
 	}
 
-	if(!oper_p->rsa_pubkey)
+	if(!oper_p->rsa_pubkey && !oper_p->x25519_pubkey)
 	{
 		sendto_one_notice(source_p, ":I'm sorry, PK authentication is not enabled for your oper{} block.");
 		return;
@@ -270,7 +265,16 @@ m_challenge(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *sou
 		}
 	}
 
-	if(generate_challenge(&challenge, &(source_p->localClient->challenge), oper_p->rsa_pubkey))
+	bool challenge_generated
+		= oper_p->x25519_pubkey
+		? generate_challenge_gen(
+			"solanum-challenge v1-x25519-sha256",
+			EVP_PKEY_X25519,
+			EVP_sha256(),
+			oper_p->x25519_pubkey,
+			&challenge, &(source_p->localClient->challenge))
+		: generate_challenge(&challenge, &(source_p->localClient->challenge), oper_p->rsa_pubkey);
+	if(challenge_generated)
 	{
 		char *chal = challenge;
 		source_p->localClient->chal_time = rb_current_time();
@@ -293,6 +297,67 @@ m_challenge(struct MsgBuf *msgbuf_p, struct Client *client_p, struct Client *sou
 		sendto_one_notice(source_p, ":Failed to generate challenge.");
 }
 
+static void
+report_openssl_errors(void)
+{
+	ERR_load_crypto_strings();
+	for (int e, cnt = 0; (cnt < 100) && (e = ERR_get_error()); cnt++)
+	{
+		ilog(L_MAIN, "SSL error: %s", ERR_error_string(e, 0));
+	}
+}
+
+static bool
+generate_challenge_gen(char const* token, int id, EVP_MD const* md, EVP_PKEY *pub, char **r_challenge, char **r_response)
+{
+	EVP_PKEY *pkey = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+	unsigned char *epub = NULL;
+	unsigned char *shared = NULL;
+	size_t epub_len, shared_len;
+	unsigned char const* d; // will point to static buffer - do not free
+	unsigned int d_len;
+	bool success = false;
+
+	// Generate ephemeral key
+	if (NULL == (ctx = EVP_PKEY_CTX_new_id(id, NULL))) goto done;
+	if (1 != EVP_PKEY_keygen_init(ctx)) goto done;
+	if (1 != EVP_PKEY_keygen(ctx, &pkey)) goto done;
+	EVP_PKEY_CTX_free(ctx);
+
+	// Setup shared secret derivation	
+	if (NULL == (ctx = EVP_PKEY_CTX_new(pkey, NULL))) goto done;
+	if (1 != EVP_PKEY_derive_init(ctx)) goto done;
+	if (1 != EVP_PKEY_derive_set_peer(ctx, pub)) goto done;
+
+	// Extract shared secret bytes
+	if (1 != EVP_PKEY_derive(ctx, NULL, &shared_len)) goto done;
+	if (NULL == (shared = rb_malloc(shared_len))) goto done;
+	if (1 != EVP_PKEY_derive(ctx, shared, &shared_len)) goto done;
+
+	// Extract public key bytes
+	if (1 != EVP_PKEY_get_raw_public_key(pkey, NULL, &epub_len)) goto done;
+	if (NULL == (epub = rb_malloc(epub_len))) goto done;
+	if (1 != EVP_PKEY_get_raw_public_key(pkey, epub, &epub_len)) goto done;
+
+	// Compute raw expected response
+	if (NULL == (d = HMAC(md, shared, shared_len, token, strlen(token), NULL, &d_len))) goto done;
+
+	// Success - report challenge and expected response in base64
+	success = true;
+	*r_challenge = rb_base64_encode(epub, epub_len);
+	*r_response = rb_base64_encode(d, d_len);
+
+done:
+	if (!success) report_openssl_errors();
+
+	rb_free(epub);
+	rb_free(shared);
+	EVP_PKEY_CTX_free(ctx);
+	EVP_PKEY_free(pkey);
+	return success;
+}
+
 static bool
 generate_challenge(char **r_challenge, char **r_response, RSA * rsa)
 {
@@ -307,10 +372,11 @@ generate_challenge(char **r_challenge, char **r_response, RSA * rsa)
 		return false;
 	if(rb_get_random(secret, CHALLENGE_SECRET_LENGTH))
 	{
+		unsigned char md[SHA_DIGEST_LENGTH];
 		SHA1_Init(&ctx);
 		SHA1_Update(&ctx, (uint8_t *)secret, CHALLENGE_SECRET_LENGTH);
-		*r_response = rb_malloc(SHA_DIGEST_LENGTH);
-		SHA1_Final((uint8_t *)*r_response, &ctx);
+		SHA1_Final(md, &ctx);
+		*r_response = rb_base64_encode(md, sizeof md);
 
 		length = RSA_size(rsa);
 		tmp = rb_malloc(length);
@@ -328,13 +394,7 @@ generate_challenge(char **r_challenge, char **r_response, RSA * rsa)
 		*r_response = NULL;
 	}
 
-	ERR_load_crypto_strings();
-	while ((cnt < 100) && (e = ERR_get_error()))
-	{
-		ilog(L_MAIN, "SSL error: %s", ERR_error_string(e, 0));
-		cnt++;
-	}
-
+	report_openssl_errors();
 	return false;
 }
 

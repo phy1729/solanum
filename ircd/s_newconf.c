@@ -236,6 +236,9 @@ free_oper_conf(struct oper_conf *oper_p)
 
 	if(oper_p->rsa_pubkey)
 		RSA_free(oper_p->rsa_pubkey);
+
+	rb_free(oper_p->x25519_pubkey_txt);
+	EVP_PKEY_free(oper_p->x25519_pubkey);
 #endif
 
 	rb_free(oper_p);

@@ -234,7 +234,6 @@ struct LocalUser
 
 	/* time challenge response is valid for */
 	time_t chal_time;
-
 	time_t next_away;	/* Don't allow next away before... */
 	time_t last;
 

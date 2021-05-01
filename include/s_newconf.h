@@ -119,6 +119,8 @@ struct oper_conf
 #ifdef HAVE_LIBCRYPTO
 	char *rsa_pubkey_file;
 	RSA *rsa_pubkey;
+	char *x25519_pubkey_txt;
+	EVP_PKEY *x25519_pubkey;
 #endif
 };
 
