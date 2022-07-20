@@ -69,7 +69,7 @@ sigterm_handler(int sig)
 static void
 sighup_handler(int sig)
 {
-	dorehash = true;
+	ircd_shutdown("Received SIGHUP");
 }
 
 /*
